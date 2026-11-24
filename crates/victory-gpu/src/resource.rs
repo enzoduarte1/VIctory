@@ -1247,7 +1247,7 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
-    if let Some(out) = unsafe { out.as_mut() } {
+    if !out.is_null() {
         let mut desc = resource(this).desc;
         // Native D3D12 reports the levels it actually allocated for an
         // automatically sized chain; keep the title's explicit value
@@ -1255,7 +1255,8 @@ extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
         if desc.mip_levels == 0 {
             desc.mip_levels = mip_count(&desc) as u16;
         }
-        *out = desc;
+        // SAFETY: the title provides writable storage for the description.
+        unsafe { out.write(desc) };
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -1846,6 +1847,75 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn committed_array_and_volume_get_desc_mips_match_the_host() {
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        type Create = extern "system" fn(
+            This,
+            *const HeapProperties,
+            u32,
+            *const ResourceDesc,
+            u32,
+            *const c_void,
+            *const Iid,
+            *mut This,
+        ) -> HRESULT;
+        type Desc = extern "system" fn(This, *mut ResourceDesc);
+        let device = crate::device::device();
+        let create = slot::<Create>(device, 0xd8);
+        let null = std::ptr::null();
+        for (dimension, automatic) in [(3, 3), (TEXTURE_3D, 4)] {
+            for (requested, expected) in [(0, automatic), (2, 2)] {
+                let desc = ResourceDesc {
+                    dimension,
+                    depth_or_array_size: 9,
+                    ..texture(4, 2, 28, requested)
+                };
+                let mut made: This = std::ptr::null();
+                assert_eq!(
+                    create(
+                        device,
+                        &PROPERTIES,
+                        0,
+                        &desc,
+                        0,
+                        null,
+                        &RESOURCE_IIDS[0],
+                        &mut made
+                    ),
+                    S_OK
+                );
+                let mut output = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+                slot::<Desc>(made, 0x50)(made, output.as_mut_ptr());
+                // SAFETY: GetDesc wrote the entire description.
+                let guest = unsafe { output.assume_init() };
+                let host = host_resource(made).expect("ordinary texture has host backing");
+                // SAFETY: the guest resource retains the live host texture.
+                let host = unsafe { host.GetDesc() };
+                eprintln!(
+                    "dimension={dimension} requested={requested} guest={} host={}",
+                    guest.mip_levels, host.MipLevels
+                );
+                assert_eq!(
+                    (
+                        guest.dimension,
+                        guest.width,
+                        guest.height,
+                        guest.depth_or_array_size
+                    ),
+                    (dimension, 4, 2, 9)
+                );
+                assert_eq!(guest.mip_levels, expected);
+                assert_eq!(host.MipLevels, expected);
+                assert_eq!(slot::<Release>(made, 0x10)(made), 0);
+            }
+        }
     }
 
     #[test]
